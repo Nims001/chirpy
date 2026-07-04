@@ -9,6 +9,7 @@ func main(){
 		Addr:           ":8080",
 		Handler:        sermux,
 	}
+	sermux.Handle("/",http.FileServer(http.Dir("./")))
 
 	err := s.ListenAndServe()
 	if err != nil{
