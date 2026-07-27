@@ -47,9 +47,9 @@ func main() {
 	// file server expects paths relative to the root of the directory it's serving, and without stripping the prefix, it would look for files in a non-existent `/app` subdirectory.
 
 	// This makes sure that when a request comes in for `/healthz`, it gets routed to `handlerfunction`. The `handlerfunction` is defined below and simply responds with a 200 OK and the text "OK".
-	sermux.HandleFunc("/healthz", handlerfunction)
-	sermux.HandleFunc("/metrics", apiCfg.numberofRequests)
-	sermux.HandleFunc("/reset", apiCfg.resetCounter)
+	sermux.HandleFunc("GET /api/healthz", handlerfunction)
+	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
+	sermux.HandleFunc("POST /admin/reset", apiCfg.resetCounter)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -98,7 +98,15 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 
 func (cfg *apiConfig) numberofRequests(w http.ResponseWriter, r *http.Request) {
 	x := cfg.fileserverHits.Load()
-	fmt.Fprintf(w, "Hits: %d", x)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, fmt.Sprintf(`<html>
+  <body>
+    <h1>Welcome, Chirpy Admin</h1>
+    <p>Chirpy has been visited %d times!</p>
+  </body>
+</html>
+	
+	`, x))
 }
 
 func (cfg *apiConfig) resetCounter(w http.ResponseWriter, r *http.Request) {
