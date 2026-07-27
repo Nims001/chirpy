@@ -5,9 +5,15 @@ package main
 //     - `net/http` gives you everything for building an HTTP server (ServeMux, Server, FileServer, etc.)
 //     - `log` gives you tools for printing log messages, optionally with a fatal exit.
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
 )
+
+type apiConfig struct {
+	fileserverHits atomic.Int32
+}
 
 func main() {
 	// This creates a new **ServeMux** - your router. Right now it's empty; no paths are registered yet. `:=` declares and assigns in one step (shorthand for `var sermux = ...`).
@@ -35,13 +41,15 @@ func main() {
 	// - `http.Dir("./")` - treats the current directory as the root folder to serve files from.
 	// - `http.FileServer(...)` - creates a handler that knows how to serve files/directories as HTTP responses (handling things like content-type detection, directory listings, etc.).
 	// - `sermux.Handle("/app/", ...)` - registers that fileserver handler on the mux, so that any request path starting with `/app/` gets routed to it.
-	sermux.Handle("/app/", http.StripPrefix("/app", http.FileServer(http.Dir("./"))))
+	apiCfg := &apiConfig{}
+	sermux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir("./")))))
 	// we added the `http.StripPrefix` function to remove the `/app` prefix from the request path before passing it to the file server. This is necessary because the
 	// file server expects paths relative to the root of the directory it's serving, and without stripping the prefix, it would look for files in a non-existent `/app` subdirectory.
 
 	// This makes sure that when a request comes in for `/healthz`, it gets routed to `handlerfunction`. The `handlerfunction` is defined below and simply responds with a 200 OK and the text "OK".
 	sermux.HandleFunc("/healthz", handlerfunction)
-
+	sermux.HandleFunc("/metrics", apiCfg.numberofRequests)
+	sermux.HandleFunc("/reset", apiCfg.resetCounter)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -79,4 +87,22 @@ func handlerfunction(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(200)
 	w.Write([]byte("OK"))
+}
+
+func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg.fileserverHits.Add(1)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (cfg *apiConfig) numberofRequests(w http.ResponseWriter, r *http.Request) {
+	x := cfg.fileserverHits.Load()
+	fmt.Fprintf(w, "Hits: %d", x)
+}
+
+func (cfg *apiConfig) resetCounter(w http.ResponseWriter, r *http.Request) {
+	cfg.fileserverHits.Store(0)
+	w.WriteHeader(200)
+	w.Write([]byte("Counter reset successfully"))
 }
