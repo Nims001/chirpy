@@ -5,9 +5,11 @@ package main
 //     - `net/http` gives you everything for building an HTTP server (ServeMux, Server, FileServer, etc.)
 //     - `log` gives you tools for printing log messages, optionally with a fatal exit.
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync/atomic"
 )
 
@@ -50,6 +52,7 @@ func main() {
 	sermux.HandleFunc("GET /api/healthz", handlerfunction)
 	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
 	sermux.HandleFunc("POST /admin/reset", apiCfg.resetCounter)
+	sermux.HandleFunc("POST /api/validate_chirp", jsonHandler)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -113,4 +116,76 @@ func (cfg *apiConfig) resetCounter(w http.ResponseWriter, r *http.Request) {
 	cfg.fileserverHits.Store(0)
 	w.WriteHeader(200)
 	w.Write([]byte("Counter reset successfully"))
+}
+
+func jsonHandler(w http.ResponseWriter, r *http.Request) {
+
+	type Body struct {
+		JSONBODY string `json:"body"`
+	}
+	body := Body{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&body)
+
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+	} else if len(body.JSONBODY) > 140 {
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+
+	} else {
+		cleanString := cleanstringFunc(body.JSONBODY)
+
+		respondWithJSON(w, 200, map[string]interface{}{"cleaned_body": cleanString})
+	}
+
+}
+
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+
+	type returnError struct {
+		ERROR string `json:"error"`
+	}
+	returnVal := returnError{
+		ERROR: msg,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	data, err := json.Marshal(returnVal)
+	if err != nil {
+		http.Error(w, "Error generating JSON response", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(code)
+	w.Write(data)
+}
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+
+	w.Header().Set("Content-Type", "application/json")
+	data, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "Error generating JSON response", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(code)
+	w.Write(data)
+
+}
+
+func cleanstringFunc(input string) string {
+	// Remove leading and trailing whitespace
+
+	Split := strings.Split(input, " ")
+
+	for i, word := range Split {
+		// Remove punctuation from each word
+
+		if strings.ToLower(word) == "kerfuffle" || strings.ToLower(word) == "sharbert" || strings.ToLower(word) == "fornax" {
+			Split[i] = "****"
+		}
+	}
+
+	// Replace multiple spaces with a single space
+
+	return strings.Join(Split, " ")
+
 }
