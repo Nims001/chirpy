@@ -101,8 +101,10 @@ func main() {
 	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
 	sermux.HandleFunc("POST /admin/reset", apiCfg.reset)
 	// sermux.HandleFunc("POST /api/validate_chirp", jsonHandler) THIS IS NOT NEEDED NOW, chirp gets validated and cleaned in chirpsHandler in /api/chirps endpoint, so we don't need a separate endpoint for that.
-	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler)
-	sermux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
+	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler)   // this is the endpoint for creating a new user, it expects a JSON body with an "email" field.
+	sermux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler) // this is the endpoint for creating a new chirp, it expects a JSON body with a "body" field and a "user_id" field.
+
+	sermux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -322,18 +324,25 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 	type Chirp struct {
-// 		CHIRP string `json:"chirp"`
-// 	}
-// 	body := Chirp{}
-// 	decoder := json.NewDecoder(r.Body)
-// 	err := decoder.Decode(&body)
-// 	log.Printf("decoded chirp: %q", body.CHIRP)
-// 	if err != nil {
-// 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
-// 	}
+func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.databasequeries.GetAllChirps(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error fetching chirps")
+		return
+	}
 
-// 	cleanedChirp := cleanstringFunc(body.CHIRP)
+	var response []Chirp
+	for _, chirp := range chirps {
+		response = append(response, Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			User_ID:   chirp.UserID.UUID,
+		})
+	}
 
-// 	respondWithJSON(w, 201, map[string]interface{}{"cleaned_chirp": cleanedChirp})
-// }
+	respondWithJSON(w, 200, response)
+	return
+
+}
