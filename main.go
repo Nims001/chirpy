@@ -11,13 +11,42 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+
+	"database/sql"
+	"os"
+
+	"github.com/Nims001/chirpy/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
-	fileserverHits atomic.Int32
+	fileserverHits  atomic.Int32
+	databasequeries *database.Queries
+	platform        string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+
+	platform := os.Getenv("PLATFORM")
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Error opening database: %v", err)
+	}
+	dbQueries := database.New(db)
 	// This creates a new **ServeMux** - your router. Right now it's empty; no paths are registered yet. `:=` declares and assigns in one step (shorthand for `var sermux = ...`).
 	sermux := http.NewServeMux()
 
@@ -43,7 +72,7 @@ func main() {
 	// - `http.Dir("./")` - treats the current directory as the root folder to serve files from.
 	// - `http.FileServer(...)` - creates a handler that knows how to serve files/directories as HTTP responses (handling things like content-type detection, directory listings, etc.).
 	// - `sermux.Handle("/app/", ...)` - registers that fileserver handler on the mux, so that any request path starting with `/app/` gets routed to it.
-	apiCfg := &apiConfig{}
+	apiCfg := &apiConfig{databasequeries: dbQueries, platform: platform}
 	sermux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir("./")))))
 	// we added the `http.StripPrefix` function to remove the `/app` prefix from the request path before passing it to the file server. This is necessary because the
 	// file server expects paths relative to the root of the directory it's serving, and without stripping the prefix, it would look for files in a non-existent `/app` subdirectory.
@@ -53,6 +82,7 @@ func main() {
 	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
 	sermux.HandleFunc("POST /admin/reset", apiCfg.resetCounter)
 	sermux.HandleFunc("POST /api/validate_chirp", jsonHandler)
+	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -74,8 +104,8 @@ func main() {
 	// If `ListenAndServe` returns an error (e.g., the port is already in use), you log a message and exit `main`.
 	// The final `return` at the bottom is actually unreachable in the sense that `ListenAndServe` almost never returns `nil` - it blocks forever until something goes wrong.
 
-	err := s.ListenAndServe()
-	if err != nil {
+	err1 := s.ListenAndServe()
+	if err1 != nil {
 		log.Printf("Error occured")
 		return
 	}
@@ -114,8 +144,18 @@ func (cfg *apiConfig) numberofRequests(w http.ResponseWriter, r *http.Request) {
 
 func (cfg *apiConfig) resetCounter(w http.ResponseWriter, r *http.Request) {
 	cfg.fileserverHits.Store(0)
-	w.WriteHeader(200)
-	w.Write([]byte("Counter reset successfully"))
+
+	//Adding fucntionality to reset users in database as well
+
+	if cfg.platform == "dev" {
+		cfg.databasequeries.ResetUsers(r.Context())
+		w.WriteHeader(200)
+		w.Write([]byte("Counter reset successfully along with resetting users in database"))
+	} else {
+		w.WriteHeader(403)
+		w.Write([]byte("Resetting users is only allowed in dev environment"))
+	}
+
 }
 
 func jsonHandler(w http.ResponseWriter, r *http.Request) {
@@ -188,4 +228,33 @@ func cleanstringFunc(input string) string {
 
 	return strings.Join(Split, " ")
 
+}
+
+func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
+
+	type Email struct {
+		EMAIL string `json:"email"`
+	}
+	body := Email{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&body)
+	log.Printf("decoded email: %q", body.EMAIL)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+	}
+
+	user, err2 := cfg.databasequeries.CreateUser(r.Context(), body.EMAIL)
+	if err2 != nil {
+		log.Printf("createUser error: %v", err2)
+		respondWithError(w, http.StatusInternalServerError, "Error creating user")
+		return
+	}
+
+	returnstruct := User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+	respondWithJSON(w, 201, returnstruct)
 }
