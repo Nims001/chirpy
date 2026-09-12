@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Nims001/chirpy/internal/auth"
+
 	"github.com/google/uuid"
 
 	"database/sql"
@@ -101,10 +103,12 @@ func main() {
 	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
 	sermux.HandleFunc("POST /admin/reset", apiCfg.reset)
 	// sermux.HandleFunc("POST /api/validate_chirp", jsonHandler) THIS IS NOT NEEDED NOW, chirp gets validated and cleaned in chirpsHandler in /api/chirps endpoint, so we don't need a separate endpoint for that.
-	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler)   // this is the endpoint for creating a new user, it expects a JSON body with an "email" field.
+	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler) // this is the endpoint for creating a new user, it expects a JSON body with an "email" field.
+	sermux.HandleFunc("POST /api/login", apiCfg.userLogin)
 	sermux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler) // this is the endpoint for creating a new chirp, it expects a JSON body with a "body" field and a "user_id" field.
 
 	sermux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
+	sermux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpByID)
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -256,18 +260,32 @@ func cleanstringFunc(input string) string {
 
 func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
 
-	type Email struct {
-		EMAIL string `json:"email"`
+	type CreateUserParams struct {
+		EMAIL    string `json:"email"`
+		PASSWORD string `json:"password"`
 	}
-	body := Email{}
+	body := CreateUserParams{}
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&body)
 	log.Printf("decoded email: %q", body.EMAIL)
+	log.Printf("decoded password: %q", body.PASSWORD)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+	hashedPassword, err1 := auth.HashPassword(body.PASSWORD)
+	body.PASSWORD = hashedPassword
+	if err1 != nil {
+		log.Printf("hashPassword error: %v", err1)
+		respondWithError(w, http.StatusInternalServerError, "Error hashing password")
+		return
 	}
 
-	user, err2 := cfg.databasequeries.CreateUser(r.Context(), body.EMAIL)
+	arg := database.CreateUserParams{
+		Email:          body.EMAIL,
+		HashedPassword: body.PASSWORD,
+	}
+	user, err2 := cfg.databasequeries.CreateUser(r.Context(), arg)
 	if err2 != nil {
 		log.Printf("createUser error: %v", err2)
 		respondWithError(w, http.StatusInternalServerError, "Error creating user")
@@ -284,6 +302,44 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
 		Email:     user.Email,
 	}
 	respondWithJSON(w, 201, returnstruct)
+}
+
+func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
+	type loginParams struct {
+		EMAIL    string `json:"email"`
+		PASSWORD string `json:"password"`
+	}
+	body := loginParams{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&body)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Couldn't decode login request json")
+		return
+	}
+
+	user, err := cfg.databasequeries.GetUserByEmail(r.Context(), body.EMAIL)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	userexist, err1 := auth.CheckPasswordHash(user.HashedPassword, body.PASSWORD)
+	if err1 != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error checking password")
+		return
+	}
+	if !userexist {
+		respondWithError(w, 401, "Unauthorized")
+		return
+	}
+	responseStruct := User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+
+	respondWithJSON(w, 200, responseStruct)
 }
 func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 
@@ -343,6 +399,27 @@ func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondWithJSON(w, 200, response)
-	return
 
+}
+
+func (cfg *apiConfig) getChirpByID(w http.ResponseWriter, r *http.Request) {
+	chirpID := r.PathValue("chirpID")
+	parsedID, err := uuid.Parse(chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+	chirp, err := cfg.databasequeries.GetChirpByID(r.Context(), parsedID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Chirp not found")
+		return
+	}
+
+	respondWithJSON(w, 200, Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		User_ID:   chirp.UserID.UUID,
+	})
 }
