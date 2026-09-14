@@ -323,7 +323,7 @@ func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userexist, err1 := auth.CheckPasswordHash(user.HashedPassword, body.PASSWORD)
+	userexist, err1 := auth.CheckPasswordHash(body.PASSWORD, user.HashedPassword)
 	if err1 != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error checking password")
 		return
