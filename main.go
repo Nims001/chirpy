@@ -29,6 +29,7 @@ type apiConfig struct {
 	fileserverHits  atomic.Int32
 	databasequeries *database.Queries
 	platform        string
+	secret          string
 }
 
 type Chirp struct {
@@ -40,10 +41,12 @@ type Chirp struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func main() {
@@ -53,6 +56,8 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 
+	// creating secret key for JWT token generation and validation, which is loaded from the environment variable `SECRET_KEY`.
+	secretString := os.Getenv("SECRET_KEY")
 	// connecting to the database using the connection string from the environment variable `DB_URL`.
 	// The `sql.Open` function returns a database handle and an error. If there's an error opening the database, it logs the error and exits the program.
 	db, err := sql.Open("postgres", dbURL)
@@ -78,7 +83,7 @@ func main() {
 
 	// This creates an `apiConfig` struct that holds the database queries and platform information.
 	// This struct is used to pass around configuration and shared state (like the request counter) to the various handler functions.
-	apiCfg := &apiConfig{databasequeries: dbQueries, platform: platform}
+	apiCfg := &apiConfig{databasequeries: dbQueries, platform: platform, secret: secretString}
 
 	// This line registers a new route with the ServeMux:
 	// 	Notice: at this point, `sermux` has no routes yet, but that's fine because Go doesn't execute this code top-to-bottom in the sense of "checking" anything - it's just building objects in memory.
@@ -103,12 +108,17 @@ func main() {
 	sermux.HandleFunc("GET /admin/metrics", apiCfg.numberofRequests)
 	sermux.HandleFunc("POST /admin/reset", apiCfg.reset)
 	// sermux.HandleFunc("POST /api/validate_chirp", jsonHandler) THIS IS NOT NEEDED NOW, chirp gets validated and cleaned in chirpsHandler in /api/chirps endpoint, so we don't need a separate endpoint for that.
-	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler) // this is the endpoint for creating a new user, it expects a JSON body with an "email" field.
-	sermux.HandleFunc("POST /api/login", apiCfg.userLogin)
-	sermux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler) // this is the endpoint for creating a new chirp, it expects a JSON body with a "body" field and a "user_id" field.
+	sermux.HandleFunc("POST /api/users", apiCfg.usersHandler)     // this is the endpoint for creating a new user, it expects a JSON body with an "email" field.
+	sermux.HandleFunc("PUT /api/users", apiCfg.updateUserHandler) // this is the endpoint for updating an existing user, it expects a JSON body with an "email" field and a "password" field.
+	sermux.HandleFunc("POST /api/login", apiCfg.userLogin)        // login create JWT and refresh token, expects a JSON body with an "email" field and a "password" field.
+	sermux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler) // refresh the JWT token using the refresh token, expects a Bearer token in the Authorization header.
+	sermux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)   // revoke the refresh token, expects a Bearer token in the Authorization header.
 
+	sermux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler) // this is the endpoint for creating a new chirp, it expects a JSON body with a "body" field and a "user_id" field.
 	sermux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
 	sermux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpByID)
+	sermux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirp)
+
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -304,10 +314,69 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, 201, returnstruct)
 }
 
+func (cfg *apiConfig) updateUserHandler(w http.ResponseWriter, r *http.Request) {
+	// receive new email and password from the request body
+	type UpdateUserParams struct {
+		EMAIL    string `json:"email"`
+		PASSWORD string `json:"password"`
+	}
+	body := UpdateUserParams{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&body)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong")
+		return
+	}
+
+	// get the user from the token in the request header, so that we can update the user's email and password in the database.
+	userTokenHeader, err1 := auth.GetBearerToken(r.Header)
+	if err1 != nil {
+		respondWithError(w, 401, err1.Error())
+		return
+	}
+	// get user id from the token, so that we can update the user's email and password in the database. also validate the token to make sure it's valid and not expired.
+	id, err3 := auth.ValidateJWT(userTokenHeader, cfg.secret)
+
+	if err3 != nil {
+		log.Printf("Validate token error: %v", err3)
+		respondWithError(w, 401, "Error fetching user")
+		return
+	}
+
+	// create new password hash from the new password, so that we can update the user's password in the database.
+	hashedPassword, err1 := auth.HashPassword(body.PASSWORD)
+	body.PASSWORD = hashedPassword
+	if err1 != nil {
+		log.Printf("hashPassword error: %v", err1)
+		respondWithError(w, http.StatusInternalServerError, "Error hashing password")
+		return
+	}
+
+	arg := database.UpdateUserParams{
+		Email:          body.EMAIL,
+		HashedPassword: body.PASSWORD,
+		ID:             id,
+	}
+	newUser, err2 := cfg.databasequeries.UpdateUser(r.Context(), arg)
+	if err2 != nil {
+		log.Printf("updateUser error: %v", err2)
+		respondWithError(w, http.StatusInternalServerError, "Error updating user")
+		return
+	}
+	returnstruct := User{
+		ID:        newUser.ID,
+		CreatedAt: newUser.CreatedAt,
+		UpdatedAt: newUser.UpdatedAt,
+		Email:     newUser.Email,
+	}
+	respondWithJSON(w, 200, returnstruct)
+}
+
 func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 	type loginParams struct {
 		EMAIL    string `json:"email"`
 		PASSWORD string `json:"password"`
+		//dont need this from refresh token lesson onward EXPIRES  int    `json:"expires_in_seconds"` // in seconds
 	}
 	body := loginParams{}
 	decoder := json.NewDecoder(r.Body)
@@ -323,6 +392,11 @@ func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//creating the JWT Token by taking ID from userid, secret from apiconfig and expires from the request body. The token is then returned to the user in the response.
+	tokenString, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(3600)*time.Second)
+	refreshToken := auth.MakeRefreshToken()
+	log.Printf("created refresh token: %q (len=%d)", refreshToken, len(refreshToken))
+
 	userexist, err1 := auth.CheckPasswordHash(body.PASSWORD, user.HashedPassword)
 	if err1 != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error checking password")
@@ -332,15 +406,94 @@ func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, 401, "Unauthorized")
 		return
 	}
+	// to store refresh tokens in database
+	arg := database.CreateRefreshTokenParams{
+		Token:  refreshToken,
+		UserID: uuid.NullUUID{UUID: user.ID, Valid: true},
+	}
+
+	_, error1 := cfg.databasequeries.CreateRefreshToken(r.Context(), arg)
+	log.Printf("CreateRefreshToken error: %v", error1)
+	if error1 != nil {
+		respondWithError(w, 400, "couldn't create refresh query in database")
+		return
+	}
 	responseStruct := User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		Token:        tokenString,
+		RefreshToken: refreshToken,
 	}
 
 	respondWithJSON(w, 200, responseStruct)
 }
+
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
+
+	refreshToken, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+
+	refresh_token_data, err := cfg.databasequeries.GetUserFromRefreshToken(r.Context(), refreshToken)
+	log.Printf("refresh lookup result: %+v, err: %v", refresh_token_data, err)
+	if err != nil {
+		respondWithError(w, 401, "refresh token not found")
+		return
+	}
+	log.Printf("check: expired=%v, revokedValid=%v, revokedBefore=%v",
+		refresh_token_data.ExpiresAt.Before(time.Now()),
+		refresh_token_data.RevokedAt.Valid,
+		refresh_token_data.RevokedAt.Time.Before(time.Now()))
+	if refresh_token_data.ExpiresAt.Before(time.Now()) || refresh_token_data.RevokedAt.Valid {
+		respondWithError(w, 401, "refresh token expired or revoked")
+		return
+	}
+
+	// If we reach this point, we have a valid user from the refresh token
+	// Generate a new access token and refresh token
+	tokenString, err := auth.MakeJWT(refresh_token_data.UserID.UUID, cfg.secret, time.Duration(3600)*time.Second)
+	if err != nil {
+		respondWithError(w, 500, "Error generating token")
+		return
+	}
+	type responseStruct struct {
+		Token string `json:"token"`
+	}
+
+	response := responseStruct{
+		Token: tokenString,
+	}
+
+	respondWithJSON(w, 200, response)
+
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		respondWithError(w, 400, err.Error())
+		return
+	}
+	log.Printf("revoking token: %q", refreshToken)
+	log.Printf("received refresh token: %q (len=%d)", refreshToken, len(refreshToken))
+	data, err1 := cfg.databasequeries.RevokeRefreshToken(r.Context(), refreshToken)
+	log.Printf("revoke result: %+v, err: %v", data, err1)
+
+	data.RevokedAt = sql.NullTime{Time: time.Now(), Valid: true}
+	if err1 != nil {
+		respondWithError(w, 400, err1.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+
+}
+
 func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 
 	type CreateChirpParams struct {
@@ -350,12 +503,23 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 	body := CreateChirpParams{}
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&body)
+	jwtToken, err1 := auth.GetBearerToken(r.Header)
+	userid, err2 := auth.ValidateJWT(jwtToken, cfg.secret)
+
+	body.UserID = uuid.NullUUID{UUID: userid, Valid: true} // type conversion from uuid.UUID to uuid.NullUUID
+	if err1 != nil {
+		respondWithError(w, http.StatusUnauthorized, err1.Error())
+		return
+	}
+	if err2 != nil {
+		respondWithError(w, http.StatusUnauthorized, err2.Error())
+		return
+	}
 
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong decoding json")
 	} else if len(body.Body) > 140 {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-
 	} else {
 		body.Body = cleanstringFunc(body.Body)
 
@@ -422,4 +586,44 @@ func (cfg *apiConfig) getChirpByID(w http.ResponseWriter, r *http.Request) {
 		Body:      chirp.Body,
 		User_ID:   chirp.UserID.UUID,
 	})
+}
+
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	chirpID := r.PathValue("chirpID")
+	parsedID, err := uuid.Parse(chirpID)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
+
+	chirp, err := cfg.databasequeries.GetChirpByID(r.Context(), parsedID)
+	if err != nil {
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+
+	if chirp.UserID.UUID != userID {
+		respondWithError(w, 403, "You are not authorized to delete this chirp")
+		return
+	}
+
+	_, err = cfg.databasequeries.DeleteChirp(r.Context(), parsedID)
+	if err != nil {
+		respondWithError(w, 403, "Error deleting chirp")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

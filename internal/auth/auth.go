@@ -3,8 +3,11 @@ package auth
 //package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
-	"testing"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/alexedwards/argon2id"
@@ -70,45 +73,26 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 	}
 }
 
-func TestToken(t *testing.T) {
-	tokenSecret := "mysecretkey"
-	userID := uuid.New()
-	// Generate a token
-	token, err := MakeJWT(userID, tokenSecret, time.Hour)
-	if err != nil {
-		t.Errorf("Failed to generate token: %v", err)
-	} else {
-		t.Logf("Generated token: %s", token)
+func GetBearerToken(headers http.Header) (string, error) {
+	// we are specified in headers that the Authorization header should be in the format "Bearer <token>"
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("Authorization header is missing")
 	}
 
-	// Validate the token
-	validatedUserID, err := ValidateJWT(token, tokenSecret)
-	if err != nil {
-		t.Errorf("Failed to validate token: %v", err)
+	authHeaderParts := strings.Split(authHeader, " ")
+	if len(authHeaderParts) != 2 || authHeaderParts[0] != "Bearer" {
+		return "", fmt.Errorf("Invalid Authorization header format")
 	}
+	// return the token part of the header
+	return authHeaderParts[1], nil
+}
 
-	if validatedUserID != userID {
-		t.Errorf("Expected userID %v, got %v", userID, validatedUserID)
-	} else {
-		t.Logf("Successfully validated token for userID: %v", validatedUserID)
-	}
+func MakeRefreshToken() string {
+	key := make([]byte, 32) // creates a 32-byte slice
+	rand.Read(key)          // key is filled with random bytes
 
-	expiredToken, err := MakeJWT(userID, tokenSecret, -time.Hour) // Create an expired token
-	if err != nil {
-		t.Errorf("Failed to generate expired token: %v", err)
-	}
-
-	_, err = ValidateJWT(expiredToken, tokenSecret)
-	if err == nil {
-		t.Errorf("Expected error for expired token, got nil")
-	} else {
-		t.Logf("Successfully caught expired token: %v", err)
-	}
-
-	_, err = ValidateJWT(token, "wrongsecret")
-	if err == nil {
-		t.Errorf("Expected error for invalid token")
-	} else {
-		t.Logf("Successfully caught invalid token: %v", err)
-	}
+	// convert the random bytes to a hex string representation
+	encodedStr := hex.EncodeToString(key)
+	return encodedStr
 }
