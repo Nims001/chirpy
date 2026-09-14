@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -552,25 +553,74 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, r *http.Request) {
-	chirps, err := cfg.databasequeries.GetAllChirps(r.Context())
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Error fetching chirps")
+
+	sortt := r.URL.Query().Get("sort")
+	if sortt != "" && sortt != "asc" && sortt != "desc" {
+		respondWithError(w, http.StatusBadRequest, "Invalid sort parameter")
 		return
 	}
 
-	var response []Chirp
-	for _, chirp := range chirps {
-		response = append(response, Chirp{
-			ID:        chirp.ID,
-			CreatedAt: chirp.CreatedAt,
-			UpdatedAt: chirp.UpdatedAt,
-			Body:      chirp.Body,
-			User_ID:   chirp.UserID.UUID,
-		})
+	var orderBy string
+	if sortt == "desc" {
+		orderBy = "DESC"
+	} else {
+		orderBy = "ASC"
 	}
 
-	respondWithJSON(w, 200, response)
+	s := r.URL.Query().Get("author_id")
+	if s != "" {
+		uid := uuid.NullUUID{UUID: uuid.MustParse(s), Valid: true}
+		chirps, err1 := cfg.databasequeries.GetChirpsByUserID(r.Context(), uid)
+		if err1 != nil {
+			respondWithError(w, http.StatusInternalServerError, "Error fetching chirps by user ID")
+			return
+		}
 
+		var response []Chirp
+		for _, chirp := range chirps {
+			response = append(response, Chirp{
+				ID:        chirp.ID,
+				CreatedAt: chirp.CreatedAt,
+				UpdatedAt: chirp.UpdatedAt,
+				Body:      chirp.Body,
+				User_ID:   chirp.UserID.UUID,
+			})
+		}
+		sort.Slice(response, func(i, j int) bool {
+			if orderBy == "ASC" {
+				return response[i].CreatedAt.Before(response[j].CreatedAt)
+			}
+			return response[i].CreatedAt.After(response[j].CreatedAt)
+		})
+
+		respondWithJSON(w, 200, response)
+		return
+	} else {
+		chirps, err := cfg.databasequeries.GetAllChirps(r.Context())
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Error fetching chirps")
+			return
+		}
+
+		var response []Chirp
+		for _, chirp := range chirps {
+			response = append(response, Chirp{
+				ID:        chirp.ID,
+				CreatedAt: chirp.CreatedAt,
+				UpdatedAt: chirp.UpdatedAt,
+				Body:      chirp.Body,
+				User_ID:   chirp.UserID.UUID,
+			})
+		}
+		sort.Slice(response, func(i, j int) bool {
+			if orderBy == "ASC" {
+				return response[i].CreatedAt.Before(response[j].CreatedAt)
+			}
+			return response[i].CreatedAt.After(response[j].CreatedAt)
+		})
+
+		respondWithJSON(w, 200, response)
+	}
 }
 
 func (cfg *apiConfig) getChirpByID(w http.ResponseWriter, r *http.Request) {
