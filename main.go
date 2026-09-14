@@ -30,6 +30,7 @@ type apiConfig struct {
 	databasequeries *database.Queries
 	platform        string
 	secret          string
+	polkakey        string
 }
 
 type Chirp struct {
@@ -47,6 +48,7 @@ type User struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func main() {
@@ -55,6 +57,7 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	polkakey := os.Getenv("POLKA_KEY")
 
 	// creating secret key for JWT token generation and validation, which is loaded from the environment variable `SECRET_KEY`.
 	secretString := os.Getenv("SECRET_KEY")
@@ -83,7 +86,7 @@ func main() {
 
 	// This creates an `apiConfig` struct that holds the database queries and platform information.
 	// This struct is used to pass around configuration and shared state (like the request counter) to the various handler functions.
-	apiCfg := &apiConfig{databasequeries: dbQueries, platform: platform, secret: secretString}
+	apiCfg := &apiConfig{databasequeries: dbQueries, platform: platform, secret: secretString, polkakey: polkakey}
 
 	// This line registers a new route with the ServeMux:
 	// 	Notice: at this point, `sermux` has no routes yet, but that's fine because Go doesn't execute this code top-to-bottom in the sense of "checking" anything - it's just building objects in memory.
@@ -119,6 +122,7 @@ func main() {
 	sermux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpByID)
 	sermux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirp)
 
+	sermux.HandleFunc("POST /api/polka/webhooks", apiCfg.polkaWebhookHandler) // this is the endpoint for receiving webhooks from polka, it expects a JSON body with a "event" field and a "data" field with "user_id" field in it.
 	// 	Note: this line runs _after_ `s` was created, but that's fine in Go - `s.Handler` holds a _reference_ to `sermux`, not a snapshot. So even though you registered the route after building the server struct, the server will still see it because it's looking at the same `sermux` object in memory.
 
 	// ```go
@@ -306,10 +310,11 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
 	// This is because the User struct returned by CreateUser may contain additional fields that we don't want to expose in the API response and the
 	// field names may be different from what we want to return in the API response.
 	returnstruct := User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	}
 	respondWithJSON(w, 201, returnstruct)
 }
@@ -364,10 +369,11 @@ func (cfg *apiConfig) updateUserHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	returnstruct := User{
-		ID:        newUser.ID,
-		CreatedAt: newUser.CreatedAt,
-		UpdatedAt: newUser.UpdatedAt,
-		Email:     newUser.Email,
+		ID:          newUser.ID,
+		CreatedAt:   newUser.CreatedAt,
+		UpdatedAt:   newUser.UpdatedAt,
+		Email:       newUser.Email,
+		IsChirpyRed: newUser.IsChirpyRed.Bool,
 	}
 	respondWithJSON(w, 200, returnstruct)
 }
@@ -425,6 +431,7 @@ func (cfg *apiConfig) userLogin(w http.ResponseWriter, r *http.Request) {
 		Email:        user.Email,
 		Token:        tokenString,
 		RefreshToken: refreshToken,
+		IsChirpyRed:  user.IsChirpyRed.Bool,
 	}
 
 	respondWithJSON(w, 200, responseStruct)
@@ -626,4 +633,55 @@ func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) polkaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+
+	polkaapikey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid API key")
+		return
+	}
+
+	if polkaapikey != cfg.polkakey {
+		respondWithError(w, 401, "API key does not match")
+		return
+	}
+
+	// struct to hold the webhook payload from polka, which contains an event type and data with user_id.
+	type PolkaWebhook struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+
+	polka := PolkaWebhook{}
+	// decoding json payload from the request body into the PolkaWebhook struct. If there's an error decoding, it responds with a 400 Bad Request.
+	decoder := json.NewDecoder(r.Body)
+	err1 := decoder.Decode(&polka)
+	if err1 != nil {
+		respondWithError(w, http.StatusBadRequest, "Something went wrong decoding json")
+		return
+	}
+
+	if polka.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if polka.Event == "user.upgraded" {
+
+		u, err := cfg.databasequeries.UpdateToChirpyRed(r.Context(), polka.Data.UserID)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Error updating user to chirpy red")
+			return
+		}
+		if u.ID != polka.Data.UserID {
+			respondWithError(w, 404, "User Not Found")
+		}
+
+		w.WriteHeader(204)
+	}
+
 }
